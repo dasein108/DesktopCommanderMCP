@@ -5,9 +5,11 @@ import fetch from 'cross-fetch';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { isBinaryFile } from 'isbinaryfile';
-import {capture} from '../utils/capture.js';
-import {withTimeout} from '../utils/withTimeout.js';
-import {configManager} from '../config-manager.js';
+import { capture } from '../utils/capture.js';
+import { withTimeout } from '../utils/withTimeout.js';
+import { configManager } from '../config-manager.js';
+import { isPdfFile } from "./mime-types.js";
+import { pdfToMarkdown, markdownToPdf } from './pdf.js';
 
 // CONSTANTS SECTION - Consolidate all timeouts and thresholds
 const FILE_OPERATION_TIMEOUTS = {
@@ -63,11 +65,12 @@ async function getFileLineCount(filePath: string): Promise<number | undefined> {
  * @param filePath Path to the file
  * @returns Object with mimeType and isImage properties
  */
-async function getMimeTypeInfo(filePath: string): Promise<{ mimeType: string; isImage: boolean }> {
-    const { getMimeType, isImageFile } = await import('./mime-types.js');
+async function getMimeTypeInfo(filePath: string): Promise<{ mimeType: string; isImage: boolean; isPdf: boolean }> {
+    const { getMimeType, isImageFile, isPdfFile } = await import('./mime-types.js');
     const mimeType = getMimeType(filePath);
     const isImage = isImageFile(mimeType);
-    return { mimeType, isImage };
+    const isPdf = isPdfFile(mimeType);
+    return { mimeType, isImage, isPdf };
 }
 
 /**
@@ -96,12 +99,12 @@ async function getDefaultReadLength(): Promise<number> {
  */
 function getBinaryFileInstructions(filePath: string, mimeType: string): string {
     const fileName = path.basename(filePath);
-    
+
     return `Cannot read binary file as text: ${fileName} (${mimeType})
 
 Use start_process + interact_with_process to analyze binary files with appropriate tools (Node.js or Python libraries, command-line utilities, etc.).
 
-The read_file tool only handles text files and images.`;
+The read_file tool only handles text files, images or PDFs.`;
 }
 
 // Initialize allowed directories from configuration
@@ -179,14 +182,14 @@ async function isPathAllowed(pathToCheck: string): Promise<boolean> {
     }
 
     let normalizedPathToCheck = normalizePath(pathToCheck);
-    if(normalizedPathToCheck.slice(-1) === path.sep) {
+    if (normalizedPathToCheck.slice(-1) === path.sep) {
         normalizedPathToCheck = normalizedPathToCheck.slice(0, -1);
     }
 
     // Check if the path is within any allowed directory
     const isAllowed = allowedDirectories.some(allowedDir => {
         let normalizedAllowedDir = normalizePath(allowedDir);
-        if(normalizedAllowedDir.slice(-1) === path.sep) {
+        if (normalizedAllowedDir.slice(-1) === path.sep) {
             normalizedAllowedDir = normalizedAllowedDir.slice(0, -1);
         }
 
@@ -300,7 +303,7 @@ export async function readFileFromUrl(url: string): Promise<FileResult> {
     // Set up fetch with timeout
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FILE_OPERATION_TIMEOUTS.URL_FETCH);
-    
+
     try {
         const response = await fetch(url, {
             signal: controller.signal
@@ -313,11 +316,23 @@ export async function readFileFromUrl(url: string): Promise<FileResult> {
             throw new Error(`HTTP error! Status: ${response.status}`);
         }
 
-        // Get MIME type from Content-Type header
+        // Get MIME type from Content-Type header or infer from URL
         const contentType = response.headers.get('content-type') || 'text/plain';
         const isImage = isImageFile(contentType);
+        const isPdf = isPdfFile(contentType) || url.toLowerCase().endsWith('.pdf');
 
-        if (isImage) {
+        // NEW: Add PDF handling before image check
+        if (isPdf) {
+            // Use URL directly - pdfreader handles URL downloads internally
+            const textContent = await pdfToMarkdown(url);
+
+            return {
+                content: textContent,
+                mimeType: 'text/plain',
+                isImage: false
+            };
+
+        } else if (isImage) {
             // For images, convert to base64
             const buffer = await response.arrayBuffer();
             const content = Buffer.from(buffer).toString('base64');
@@ -353,8 +368,8 @@ export async function readFileFromUrl(url: string): Promise<FileResult> {
  * @returns Enhanced status message string
  */
 function generateEnhancedStatusMessage(
-    readLines: number, 
-    offset: number, 
+    readLines: number,
+    offset: number,
     totalLines?: number,
     isNegativeOffset: boolean = false
 ): string {
@@ -370,7 +385,7 @@ function generateEnhancedStatusMessage(
         if (totalLines !== undefined) {
             const endLine = offset + readLines;
             const remainingLines = Math.max(0, totalLines - endLine);
-            
+
             if (offset === 0) {
                 return `[Reading ${readLines} lines from start (total: ${totalLines} lines, ${remainingLines} remaining)]`;
             } else {
@@ -646,7 +661,7 @@ export async function readFileFromDisk(filePath: string, offset: number = 0, len
     if (!filePath || typeof filePath !== 'string') {
         throw new Error('Invalid file path provided');
     }
-    
+
     // Get default length from config if not provided
     if (length === undefined) {
         length = await getDefaultReadLength();
@@ -671,16 +686,25 @@ export async function readFileFromDisk(filePath: string, offset: number = 0, len
     } catch (error) {
         console.error('error catch ' + error);
         const errorMessage = error instanceof Error ? error.message : String(error);
-        capture('server_read_file_error', {error: errorMessage, fileExtension: fileExtension});
+        capture('server_read_file_error', { error: errorMessage, fileExtension: fileExtension });
         // If we can't stat the file, continue anyway and let the read operation handle errors
     }
 
     // Detect the MIME type based on file extension
-    const { mimeType, isImage } = await getMimeTypeInfo(validPath);
-    
+    const { mimeType, isImage, isPdf } = await getMimeTypeInfo(validPath);
+
     // Use withTimeout to handle potential hangs
     const readOperation = async () => {
-        if (isImage) {
+        if (isPdf) {
+            // Pass file path directly to extractPdfText which handles file reading
+            const textContent = await pdfToMarkdown(validPath);
+
+            return {
+                content: textContent,
+                mimeType: 'text/plain',
+                isImage: false
+            };
+        } else if (isImage) {
             // For image files, read as Buffer and convert to base64
             // Images are always read in full, ignoring offset and length
             const buffer = await fs.readFile(validPath);
@@ -696,14 +720,14 @@ export async function readFileFromDisk(filePath: string, offset: number = 0, len
                 if (error instanceof Error && error.message.includes('Cannot read binary file as text:')) {
                     return { content: error.message, mimeType: 'text/plain', isImage: false };
                 }
-                
+
                 // If UTF-8 reading fails for other reasons, also check if it's binary
                 const isBinary = await isBinaryFile(validPath);
                 if (isBinary) {
                     const instructions = getBinaryFileInstructions(validPath, mimeType);
                     return { content: instructions, mimeType: 'text/plain', isImage: false };
                 }
-                
+
                 // Only if it's truly not binary, then we have a real UTF-8 reading error
                 throw error;
             }
@@ -961,7 +985,7 @@ export async function searchFiles(rootPath: string, pattern: string): Promise<st
     // Use the new search manager for better performance
     // This provides a temporary compatibility layer until we fully migrate to search sessions
     const { searchManager } = await import('../search-manager.js');
-    
+
     try {
         const result = await searchManager.startSearch({
             rootPath,
@@ -978,27 +1002,27 @@ export async function searchFiles(rootPath: string, pattern: string): Promise<st
         let allResults: string[] = [];
         let isComplete = result.isComplete;
         let startTime = Date.now();
-        
+
         // Add initial results
         for (const searchResult of result.results) {
             if (searchResult.type === 'file') {
                 allResults.push(searchResult.file);
             }
         }
-        
+
         while (!isComplete) {
             await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms
-            
+
             const results = searchManager.readSearchResults(sessionId);
             isComplete = results.isComplete;
-            
+
             // Add new file paths to results
             for (const searchResult of results.results) {
                 if (searchResult.file !== '__LAST_READ_MARKER__' && searchResult.type === 'file') {
                     allResults.push(searchResult.file);
                 }
             }
-            
+
             // Safety check to prevent infinite loops (30 second timeout)
             if (Date.now() - startTime > 30000) {
                 searchManager.terminateSearch(sessionId);
@@ -1019,7 +1043,7 @@ export async function searchFiles(rootPath: string, pattern: string): Promise<st
         capture('server_search_files_ripgrep_fallback', {
             error: error instanceof Error ? error.message : 'Unknown error'
         });
-        
+
         return await searchFilesNodeJS(rootPath, pattern);
     }
 }
@@ -1100,10 +1124,10 @@ export async function getFileInfo(filePath: string): Promise<Record<string, any>
     if (stats.isFile() && stats.size < FILE_SIZE_LIMITS.LINE_COUNT_LIMIT) {
         try {
             // Get MIME type information
-            const { mimeType, isImage } = await getMimeTypeInfo(validPath);
-            
+            const { mimeType, isImage, isPdf } = await getMimeTypeInfo(validPath);
+
             // Only count lines for non-image, likely text files
-            if (!isImage) {
+            if (!isImage && !isPdf) {
                 const content = await fs.readFile(validPath, 'utf8');
                 const lineCount = countLines(content);
                 info.lineCount = lineCount;
@@ -1117,4 +1141,21 @@ export async function getFileInfo(filePath: string): Promise<Record<string, any>
     }
 
     return info;
+}
+
+export async function writePdf(filePath: string, content: string, options: any = {}): Promise<void> {
+    const validPath = await validatePath(filePath);
+
+    // Get file extension for telemetry
+    const fileExtension = getFileExtension(validPath);
+
+    // Capture telemetry
+    capture('server_write_pdf', {
+        fileExtension: fileExtension,
+        contentLength: content.length
+    });
+
+    // markdownToPdf requires outputPath as 2nd arg even if unused in the current implementation
+    const pdfBuffer = await markdownToPdf(content, validPath, options);
+    await fs.writeFile(validPath, pdfBuffer);
 }
