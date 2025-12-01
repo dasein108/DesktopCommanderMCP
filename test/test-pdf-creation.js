@@ -90,38 +90,31 @@ console.log('Line 3');
         // 3. Insert an appendix page at the end (from markdown)
         // 4. Merge the temporary PDF at the very end (from file path)
 
-        await writePdf(MODIFIED_FILE, [
+        await writePdf(OUTPUT_FILE, [
             {
                 type: 'delete',
-                pageIndex: 0
+                pageIndexes: [0]
             },
             {
                 type: 'delete',
-                pageIndex: -1 // Delete the last page.
-                // Sequential execution:
-                // 1. Original: [Page 1, Page 2]
-                // 2. Delete 0 (Page 1): [Page 2]
-                // 3. Delete -1 (Last page, i.e., Page 2): [] (Empty)
+                pageIndexes: [-1] // Delete the last page.
             },
             {
                 type: 'insert',
                 pageIndex: 0,
-                markdownContent: '# New Cover Page\n\nThis page was inserted dynamically.\n\n## Summary\nWe deleted the original pages and added this one.'
-                // 4. Insert at 0: [New Cover Page]
+                markdown: '# New Cover Page\n\nThis page was inserted dynamically.\n\n## Summary\nWe deleted the original pages and added this one.'
             },
             {
                 type: 'insert',
-                pageIndex: 1, // Append to end (count is 1)
-                markdownContent: '# Appendix\n\nThis page was appended to the end.'
-                // 5. Insert at 1: [New Cover Page, Appendix]
+                pageIndex: 1,
+                markdown: '# Appendix\n\nThis page was appended to the end.'
             },
             {
                 type: 'insert',
-                pageIndex: 2, // Append to end (count is 2)
-                sourcePdf: tempMergeFile
-                // 6. Insert at 2: [New Cover Page, Appendix, Merged Page]
+                pageIndex: 2,
+                sourcePdfPath: tempMergeFile
             }
-        ], { sourcePdf: OUTPUT_FILE });
+        ], MODIFIED_FILE);
 
         console.log('✅ PDF modified successfully');
         console.log(`   Saved to: ${MODIFIED_FILE}`);
